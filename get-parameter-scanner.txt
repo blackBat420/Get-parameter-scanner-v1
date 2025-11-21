@@ -1,0 +1,295 @@
+// ==UserScript==
+// @name         GET Parameter Scanner - Honk Security v1
+// @namespace    http://tampermonkey.net/
+// @version      1
+// @description  GET URL scanner with floating bubble, copy, refresh, hide panel, persistent settings (text size, font color, bg opacity, link borders), scrollable, mobile-friendly
+// @match        *://*/*
+// @grant        none
+// @run-at       document-idle
+// @author       blackBat
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const isMobile = /Mobi|Android/i.test(navigator.userAgent);
+
+    // Load saved settings from localStorage
+    let settings = JSON.parse(localStorage.getItem('gmSettings') || '{}');
+    let panelOpacity = settings.panelOpacity ?? 0.95;
+    let textSize = settings.textSize ?? 13;
+    let fontColor = settings.fontColor ?? '#7ecbff';
+    let linkBorderColor = settings.linkBorderColor ?? `rgba(255,255,255,${panelOpacity*0.15})`;
+
+    let results = [];
+
+    function saveSettings() {
+        settings = { panelOpacity, textSize, fontColor, linkBorderColor };
+        localStorage.setItem('gmSettings', JSON.stringify(settings));
+    }
+
+    /* FLOATING BUBBLE */
+    function createFloatingBubble() {
+        if (document.getElementById("gm-bubble")) return;
+
+        const bubble = document.createElement("div");
+        bubble.id = "gm-bubble";
+        bubble.innerHTML = "🤡";
+        bubble.style = `
+            position: fixed;
+            ${isMobile ? 'right:0; top:50%; transform: translateY(-50%);' : 'right:12px; bottom:12px;'}
+            height:50px;width:50px;color:#fff;border-radius:50%;
+            display:flex;align-items:center;justify-content:center;font-size:35px;
+            cursor:pointer;z-index:2147483647;user-select:none;box-shadow:0 4px 15px rgba(0,0,0,0.35);
+        `;
+        document.body.appendChild(bubble);
+
+        let dragging = false, startX = 0, startY = 0, originX = 0, originY = 0;
+
+        const startDrag = (e) => {
+            dragging = true;
+            const evt = e.type.includes('touch') ? e.touches[0] : e;
+            startX = evt.clientX; startY = evt.clientY;
+            originX = bubble.offsetLeft; originY = bubble.offsetTop;
+        };
+        const doDrag = (e) => {
+            if (!dragging) return;
+            const evt = e.type.includes('touch') ? e.touches[0] : e;
+            let x = originX + (evt.clientX - startX);
+            let y = originY + (evt.clientY - startY);
+            x = Math.max(0, Math.min(window.innerWidth - bubble.offsetWidth, x));
+            y = Math.max(0, Math.min(window.innerHeight - bubble.offsetHeight, y));
+            bubble.style.left = x + "px"; bubble.style.top = y + "px";
+            bubble.style.right = bubble.style.bottom = "auto";
+        };
+        const endDrag = () => {
+            if (!dragging) return;
+            dragging = false;
+            if (isMobile) {
+                const middleX = window.innerWidth / 2;
+                const currentLeft = bubble.offsetLeft;
+                bubble.style.left = (currentLeft + bubble.offsetWidth / 2 < middleX ? 0 : window.innerWidth - bubble.offsetWidth) + "px";
+            }
+        };
+        bubble.addEventListener("mousedown", startDrag);
+        bubble.addEventListener("touchstart", startDrag, { passive: false });
+        window.addEventListener("mousemove", doDrag);
+        window.addEventListener("touchmove", doDrag, { passive: false });
+        window.addEventListener("mouseup", endDrag);
+        window.addEventListener("touchend", endDrag);
+
+        bubble.addEventListener("click", () => {
+            const panel = document.getElementById("gm-panel");
+            if (!panel) return;
+            panel.style.display = "flex";
+            bubble.style.display = "none";
+        });
+    }
+
+    /* PANEL */
+    function createPanel() {
+        if (document.getElementById("gm-panel")) return;
+
+        const style = document.createElement("style");
+        style.innerHTML = `
+            #gm-panel{
+                position:fixed;
+                top:12px;right:12px;width:95%;max-width:460px;
+                max-height:auto;
+                background:rgba(20,20,20,${panelOpacity});
+                color:${fontColor};border-radius:10px;
+                display:none;flex-direction:column;
+                overflow:hidden;z-index:2147483647;padding-bottom:8px;
+                font-family:system-ui;font-size:${textSize}px;
+            }
+            @media(min-width:768px){#gm-panel{width:450px;top:20px;right:20px;}}
+            #gm-header{padding:10px;display:flex;flex-direction:column;gap:4px;}
+            #gm-h1{font-size:18px;font-weight:bold;color:#ffcc00;text-shadow:0 0 3px #000;margin-bottom:2px;}
+            #gm-h3{font-size:13px;font-weight:bold;color:red;text-shadow: -1px -1px 0 #000, 1px -1px 0 #000, -1px 1px 0 #000, 1px 1px 0 #000;margin-bottom:4px;}
+            #gm-buttons{display:flex;flex-wrap:wrap;gap:4px;}
+            #gm-buttons button{flex:1 1 auto;min-width:70px;background:#1976d2;color:#fff;border:none;padding:4px 6px;border-radius:4px;cursor:pointer;font-size:12px;}
+            #gm-filter{width:100%;padding:4px 6px;border-radius:4px;border:none;background:#222;color:#fff;}
+            #gm-list{overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:6px;max-height:calc(5 * 44px);}
+            .gm-item{padding:6px 8px;border-radius:6px;display:flex;justify-content:space-between;align-items:center;word-break:break-word;border:1px solid ${linkBorderColor};background:transparent;}
+            .gm-link{flex:1;cursor:pointer;color:${fontColor};text-decoration:underline;}
+            .gm-copy{margin-left:6px;background:#555;border-radius:4px;padding:2px 6px;font-size:12px;cursor:pointer;}
+            .gm-copy:hover{background:#777;}
+            #gm-settings{display:none;padding:8px;background:#222;flex-direction:column;gap:6px;}
+            #gm-settings label{font-size:12px;color:#fff;display:flex;justify-content:space-between;align-items:center;}
+            #gm-settings input[type=range]{width:100%;-webkit-appearance:none;height:6px;background:#555;border-radius:3px;outline:none;}
+            #gm-settings input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;background:#1e90ff;border-radius:50%;cursor:pointer;}
+            #gm-settings input[type=color]{width:40px;height:24px;border:none;background:none;cursor:pointer;}
+        `;
+        document.head.appendChild(style);
+
+        const panel = document.createElement("div");
+        panel.id = "gm-panel";
+        panel.innerHTML = `
+            <div id="gm-header">
+                <div id="gm-h1">Honk Security Hackers</div>
+                <div id="gm-h3">GET Parameters Scanner v1</div>
+                <input id="gm-filter" placeholder="Filter URLs..." />
+                <div id="gm-buttons">
+                    <button id="gm-refresh">Refresh</button>
+                    <button id="gm-copyall">Copy All</button>
+                    <button id="gm-show-settings">Settings ⚙️</button>
+                    <button id="gm-hide">Hide Panel</button>
+                </div>
+            </div>
+            <div id="gm-list"></div>
+            <div id="gm-settings">
+                <label>Text Size: <span id="gm-textsize-label">${textSize}px</span>
+                    <input type="range" id="gm-textsize" min="10" max="24" value="${textSize}" />
+                </label>
+                <label>Panel Transparency: <span id="gm-opacity-label">${panelOpacity}</span>
+                    <input type="range" id="gm-opacity" min="0.3" max="1" step="0.05" value="${panelOpacity}" />
+                </label>
+                <label>Font Color:
+                    <input type="color" id="gm-fontcolor" value="${fontColor}" />
+                </label>
+                <label>Link Border Color:
+                    <input type="color" id="gm-linkborder" value="${rgbaToHex(linkBorderColor)}" />
+                </label>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        // Buttons
+        document.getElementById("gm-refresh").addEventListener("click", scan);
+        document.getElementById("gm-copyall").addEventListener("click", () => {
+            if (!results.length) return;
+            const text = filteredResults().join("\n");
+            navigator.clipboard.writeText(text);
+            alert(`Copied ${filteredResults().length} URLs`);
+        });
+        document.getElementById("gm-filter").addEventListener("input", () => render());
+
+        document.getElementById("gm-show-settings").addEventListener("click", () => {
+            const settingsDiv = document.getElementById("gm-settings");
+            settingsDiv.style.display = settingsDiv.style.display === "flex" ? "none" : "flex";
+        });
+
+        document.getElementById("gm-hide").addEventListener("click", () => {
+            panel.style.display = "none";
+            document.getElementById("gm-bubble").style.display = "flex";
+        });
+
+        // Settings inputs
+        const txtSlider = document.getElementById("gm-textsize");
+        const txtLabel = document.getElementById("gm-textsize-label");
+        txtSlider.addEventListener("input", () => {
+            textSize = txtSlider.value;
+            txtLabel.textContent = textSize + "px";
+            panel.style.fontSize = textSize + "px";
+            saveSettings();
+        });
+
+        const opSlider = document.getElementById("gm-opacity");
+        const opLabel = document.getElementById("gm-opacity-label");
+        opSlider.addEventListener("input", () => {
+            panelOpacity = opSlider.value;
+            opLabel.textContent = panelOpacity;
+            panel.style.background = `rgba(20,20,20,${panelOpacity})`;
+            document.querySelectorAll(".gm-item").forEach(item => {
+                item.style.borderColor = linkBorderColor;
+            });
+            saveSettings();
+        });
+
+        const colorPicker = document.getElementById("gm-fontcolor");
+        colorPicker.addEventListener("input", () => {
+            fontColor = colorPicker.value;
+            panel.style.color = fontColor;
+            document.querySelectorAll(".gm-link").forEach(l => l.style.color = fontColor);
+            saveSettings();
+        });
+
+        const borderPicker = document.getElementById("gm-linkborder");
+        borderPicker.addEventListener("input", () => {
+            linkBorderColor = borderPicker.value;
+            document.querySelectorAll(".gm-item").forEach(item => {
+                item.style.borderColor = linkBorderColor;
+            });
+            saveSettings();
+        });
+    }
+
+    /* Helper to convert rgba to hex for input[type=color] */
+    function rgbaToHex(rgba) {
+        const m = rgba.match(/\d+/g);
+        if (!m || m.length < 3) return "#ffffff";
+        return "#" + m.slice(0,3).map(x=>('0'+parseInt(x).toString(16)).slice(-2)).join('');
+    }
+
+    /* SCAN & RENDER */
+    const abs = u => { try { return new URL(u, location.href).href; } catch { return null; } };
+
+    function scan() {
+        const set = new Map();
+        if (location.search.length > 1) set.set(location.href, location.href);
+        document.querySelectorAll("a[href*='?']").forEach(a => {
+            const u = abs(a.href);
+            if (!u) return;
+            set.set(u, u);
+        });
+        results = [...set.values()];
+        render();
+    }
+
+    function filteredResults() {
+        const filter = (document.getElementById("gm-filter")?.value || '').toLowerCase();
+        if (!filter) return results;
+        return results.filter(url => url.toLowerCase().includes(filter));
+    }
+
+    function render() {
+        const list = document.getElementById("gm-list");
+        if (!list) return;
+        list.innerHTML = "";
+        filteredResults().forEach(url => {
+            const div = document.createElement("div");
+            div.className = "gm-item";
+            div.style.border = `1px solid ${linkBorderColor}`;
+            div.style.background = "transparent";
+
+            const link = document.createElement("div");
+            link.className = "gm-link";
+            link.textContent = url;
+            link.style.color = fontColor;
+            link.addEventListener("click", () => window.open(url, "_blank"));
+
+            const copyBtn = document.createElement("div");
+            copyBtn.className = "gm-copy";
+            copyBtn.textContent = "Copy";
+            copyBtn.addEventListener("click", e => {
+                e.stopPropagation();
+                navigator.clipboard.writeText(url);
+                copyBtn.textContent = "Copied!";
+                setTimeout(() => copyBtn.textContent = "Copy", 1200);
+            });
+
+            div.appendChild(link);
+            div.appendChild(copyBtn);
+            list.appendChild(div);
+        });
+    }
+
+    /* SPA / DYNAMIC SUPPORT */
+    const observer = new MutationObserver(() => {
+        clearTimeout(observer._t);
+        observer._t = setTimeout(scan, 200);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    ["pushState", "replaceState"].forEach(fn => {
+        const orig = history[fn];
+        history[fn] = function () { orig.apply(this, arguments); window.dispatchEvent(new Event("locationchange")); };
+    });
+    window.addEventListener("popstate", () => window.dispatchEvent(new Event("locationchange")));
+    window.addEventListener("locationchange", () => setTimeout(scan, 200));
+
+    createFloatingBubble();
+    createPanel();
+    scan();
+
+})();
