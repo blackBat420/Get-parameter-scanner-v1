@@ -1,0 +1,454 @@
+// ==UserScript==
+// @name         GET Parameter Scanner + Source Viewer v1.2
+// @namespace    http://tampermonkey.net/
+// @version      1.2
+// @description  GET params + Raw HTML source viewer with sticky find, highlights, Prev/Next + floating bubble (font-color and 5-result list fixes)
+// @match        *://*/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function(){
+    'use strict';
+
+    const isMobile = /Mobi|Android/i.test(navigator.userAgent);
+
+    // persisted settings
+    let settings = JSON.parse(localStorage.getItem('gmSettings')||'{}');
+    let panelOpacity = settings.panelOpacity ?? 0.95;
+    let textSize = settings.textSize ?? 13;
+    let fontColor = settings.fontColor ?? '#7ecbff';
+    let linkBorderColor = settings.linkBorderColor ?? `rgba(255,255,255,${panelOpacity*0.15})`;
+    let results=[];
+
+    // source cache/search state
+    let cachedUrl = null;
+    let sourceLines = [];
+    let matches = [];
+    let currentMatchIndex = -1;
+
+    function saveSettings(){ settings = { panelOpacity, textSize, fontColor, linkBorderColor }; localStorage.setItem('gmSettings', JSON.stringify(settings)); }
+
+    /* ---------- Floating bubble ---------- */
+    function createFloatingBubble(){
+        if(document.getElementById('gm-bubble')) return;
+        const bubble=document.createElement('div');
+        bubble.id='gm-bubble';
+        bubble.innerHTML='🤡';
+        bubble.style=`
+            position: fixed;
+            ${isMobile?'right:6px;bottom:28%;':'right:12px;bottom:12px;'}
+            height:50px;width:50px;color:#fff;border-radius:50%;
+            display:flex;align-items:center;justify-content:center;font-size:32px;
+            cursor:pointer;z-index:2147483647;user-select:none;box-shadow:0 6px 18px rgba(0,0,0,0.35);
+        `;
+        document.body.appendChild(bubble);
+        bubble.style.display='flex';
+
+        let dragging=false, sx=0, sy=0, ox=0, oy=0;
+        const start = e => {
+            dragging = true;
+            const evt = e.type.includes('touch') ? e.touches[0] : e;
+            sx = evt.clientX; sy = evt.clientY;
+            ox = bubble.offsetLeft; oy = bubble.offsetTop;
+        };
+        const move = e => {
+            if(!dragging) return;
+            const evt = e.type.includes('touch') ? e.touches[0] : e;
+            let nx = ox + (evt.clientX - sx);
+            let ny = oy + (evt.clientY - sy);
+            nx = Math.max(0, Math.min(window.innerWidth - bubble.offsetWidth, nx));
+            ny = Math.max(0, Math.min(window.innerHeight - bubble.offsetHeight, ny));
+            bubble.style.left = nx + 'px';
+            bubble.style.top = ny + 'px';
+            bubble.style.right = bubble.style.bottom = 'auto';
+        };
+        const end = () => {
+            dragging = false;
+            if(isMobile) bubble.style.left = (bubble.offsetLeft + bubble.offsetWidth/2 < window.innerWidth/2 ? '0px' : (window.innerWidth - bubble.offsetWidth) + 'px');
+        };
+
+        bubble.addEventListener('mousedown', start);
+        bubble.addEventListener('touchstart', start, {passive:false});
+        window.addEventListener('mousemove', move);
+        window.addEventListener('touchmove', move, {passive:false});
+        window.addEventListener('mouseup', end);
+        window.addEventListener('touchend', end);
+
+        bubble.addEventListener('click', ()=>{
+            const panel = document.getElementById('gm-panel');
+            if(panel){ panel.style.display='flex'; bubble.style.display='none'; const active = document.querySelector('.gm-tab.active')?.dataset.tab || 'parameters'; if(active === 'parameters'){ const f = document.getElementById('gm-filter'); if(f) setTimeout(()=>f.focus(),60); } }
+        });
+    }
+
+    /* ---------- Panel & UI (create once) ---------- */
+    function createPanel(){
+        if(document.getElementById('gm-panel')) return;
+
+        const style = document.createElement('style');
+        style.innerHTML = `
+            /* panel root variables controlled at runtime */
+            #gm-panel{--gm-font-color: ${fontColor}; position:fixed;top:12px;right:12px;width:95%;max-width:760px;background:rgba(20,20,20,${panelOpacity});color:var(--gm-font-color);border-radius:12px;display:none;flex-direction:column;overflow:hidden;z-index:2147483647;padding-bottom:8px;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;font-size:${textSize}px;box-shadow:0 10px 36px rgba(0,0,0,0.6);}
+            #gm-header { padding:12px 14px; border-bottom:1px solid rgba(255,255,255,0.03); background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent); }
+            #gm-h1{font-size:18px;font-weight:700;color:#ffcc00;text-shadow:0 1px 3px #000;}
+            #gm-h3{font-size:12px;color:#ff8080;margin-top:6px;font-weight:600;text-shadow:0 1px 2px #000;}
+            #gm-tabs{display:flex;gap:6px;margin-top:10px;}
+            .gm-tab{flex:0 0 auto;padding:8px 12px;border-radius:8px;background:#222;color:#fff;cursor:pointer;user-select:none;}
+            .gm-tab.active{background:#1976d2;box-shadow:0 6px 14px rgba(0,0,0,0.5);font-weight:700;}
+            #gm-topcontrols{display:flex;gap:8px;align-items:center;margin-top:10px;}
+            #gm-filter{flex:1;padding:8px;border-radius:8px;border:none;background:#111;color:#fff;}
+            #gm-panel-body{display:flex;gap:12px;padding:12px;align-items:stretch;}
+            #gm-list{flex:1; /* show only 5 items height */ max-height: calc(5 * 56px); overflow:auto; padding:8px;background:transparent;border-radius:8px;}
+            .gm-item{padding:8px;border-radius:8px;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;background:rgba(255,255,255,0.02);border:1px solid ${linkBorderColor};word-break:break-word;}
+            .gm-link{flex:1;color:var(--gm-font-color);text-decoration:underline;cursor:pointer;margin-right:8px;}
+            .gm-copy{background:#2b2b2b;color:#fff;padding:6px 8px;border-radius:6px;cursor:pointer;}
+            /* Source view */
+            #gm-source-view{flex:2;display:flex;flex-direction:column;max-height:70vh;overflow:hidden;background:transparent;border-radius:8px;}
+            #gm-source-controls{position:sticky;top:0;z-index:10;padding:8px;background:linear-gradient(180deg, rgba(20,20,20,0.95), rgba(20,20,20,0.9));display:flex;gap:8px;align-items:center;border-bottom:1px solid rgba(255,255,255,0.03);}
+            #gm-find-source{flex:1;padding:8px;border-radius:6px;border:none;background:#111;color:#fff;}
+            #gm-prev-match,#gm-next-match,#gm-copy-source{background:#1976d2;color:#fff;border:none;padding:6px 10px;border-radius:6px;cursor:pointer;}
+            #gm-source-code-wrap{overflow:auto;padding:10px;background:#0b0b0b;color:var(--gm-font-color);font-family:monospace;flex:1;}
+            .line{display:flex;}
+            .line-number{width:56px;color:#666;text-align:right;padding-right:12px;user-select:none;}
+            .line-content{flex:1;white-space:pre-wrap;color:var(--gm-font-color);}
+            mark.gm-match{background: #ffd54f; color: #000; padding:0 2px; border-radius:2px;}
+            .gm-active{outline:2px solid rgba(255,204,0,0.55);background:rgba(255,204,0,0.06);}
+            #gm-settings{padding:12px;background:transparent;overflow:auto;}
+            #gm-settings label{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;color:#ddd;}
+            input[type=range]{width:60%;}
+            .small-muted{color:#aaa;font-size:12px;}
+            @media (max-width:700px){ #gm-panel{left:6px;right:6px;width:auto;max-width:none;} #gm-panel-body{flex-direction:column;} #gm-source-view{order:2;} }
+        `;
+        document.head.appendChild(style);
+
+        // build panel html
+        const panel = document.createElement('div');
+        panel.id = 'gm-panel';
+        panel.innerHTML = `
+            <div id="gm-header">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <div id="gm-h1">Honk Security Hackers</div>
+                        <div id="gm-h3">GET Parameters Scanner v20</div>
+                    </div>
+                    <div id="gm-tab-buttons" style="display:flex;gap:8px;align-items:center;">
+                        <button id="gm-hide-panel" style="background:#222;color:#fff;border-radius:8px;padding:8px;border:none;cursor:pointer;">Hide</button>
+                    </div>
+                </div>
+                <div id="gm-tabs">
+                    <div class="gm-tab active" data-tab="parameters">GET Parameters</div>
+                    <div class="gm-tab" data-tab="source">View Source</div>
+                    <div class="gm-tab" data-tab="settings">Settings</div>
+                </div>
+                <div id="gm-topcontrols" style="margin-top:10px;">
+                    <input id="gm-filter" placeholder="Filter URLs..." />
+                    <div class="small-muted" id="gm-filter-count"></div>
+                </div>
+            </div>
+
+            <div id="gm-panel-body">
+                <div id="gm-list"></div>
+
+                <div id="gm-source-view" style="display:none;">
+                    <div id="gm-source-controls">
+                        <input id="gm-find-source" placeholder="Find in source..." />
+                        <button id="gm-prev-match" title="Previous match">Prev</button>
+                        <button id="gm-next-match" title="Next match">Next</button>
+                        <div class="small-muted" id="gm-match-counter">0 / 0</div>
+                        <button id="gm-copy-source" style="margin-left:8px;">Copy All Source</button>
+                    </div>
+                    <div id="gm-source-code-wrap"><pre id="gm-source-code" style="margin:0;"></pre></div>
+                </div>
+
+                <div id="gm-settings" style="display:none;">
+                    <label>Text Size <input id="gm-textsize" type="range" min="10" max="20" value="${textSize}"></label>
+                    <label>Panel Transparency <input id="gm-opacity" type="range" min="0.3" max="1" step="0.05" value="${panelOpacity}"></label>
+                    <label>Font Color <input id="gm-fontcolor" type="color" value="${fontColor}"></label>
+                    <label>Link Border <input id="gm-linkborder" type="color" value="${rgbaToHex(linkBorderColor)}"></label>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        // references
+        const tabs = panel.querySelectorAll('.gm-tab');
+        const listEl = document.getElementById('gm-list');
+        const sourceView = document.getElementById('gm-source-view');
+        const settingsView = document.getElementById('gm-settings');
+        const filterInput = document.getElementById('gm-filter');
+        const filterCount = document.getElementById('gm-filter-count');
+
+        // store refs for other functions
+        createPanel._refs = { listEl, filterInput, filterCount, sourceView };
+
+        // dynamic filter
+        filterInput.addEventListener('input', ()=>{ render(); });
+
+        function showTab(tab){
+            listEl.style.display = 'none';
+            sourceView.style.display = 'none';
+            settingsView.style.display = 'none';
+            tabs.forEach(t=>t.classList.remove('active'));
+
+            if(tab === 'parameters'){
+                listEl.style.display = 'block';
+                tabs[0].classList.add('active');
+                filterInput.style.display = 'block';
+                setTimeout(()=>filterInput.focus(), 60);
+            } else {
+                filterInput.style.display = 'none';
+            }
+
+            if(tab === 'source'){
+                sourceView.style.display = 'flex';
+                tabs[1].classList.add('active');
+                loadSourceIfNeeded().then(()=>{ renderSource(); });
+            }
+            if(tab === 'settings'){
+                settingsView.style.display = 'block';
+                tabs[2].classList.add('active');
+            }
+
+            panel.style.display = 'flex';
+        }
+
+        tabs.forEach(t => t.addEventListener('click', ()=> showTab(t.dataset.tab)));
+
+        document.getElementById('gm-hide-panel').addEventListener('click', ()=> { panel.style.display='none'; document.getElementById('gm-bubble').style.display='flex'; });
+
+        // Copy source
+        document.getElementById('gm-copy-source').addEventListener('click', ()=>{
+            const txt = sourceLines.join('\n');
+            navigator.clipboard.writeText(txt).then(()=> alert('Source copied to clipboard') ).catch(()=> alert('Copy failed'));
+        });
+
+        // Find controls
+        const findInput = document.getElementById('gm-find-source');
+        const prevBtn = document.getElementById('gm-prev-match');
+        const nextBtn = document.getElementById('gm-next-match');
+
+        findInput.addEventListener('input', ()=> { performSearch(findInput.value); });
+
+        prevBtn.addEventListener('click', ()=> { if(matches.length===0) return; currentMatchIndex = (currentMatchIndex-1+matches.length)%matches.length; focusMatch(); });
+        nextBtn.addEventListener('click', ()=> { if(matches.length===0) return; currentMatchIndex = (currentMatchIndex+1)%matches.length; focusMatch(); });
+
+        // Settings controls (fixed: font color now applies correctly)
+        const txtSlider = document.getElementById('gm-textsize');
+        txtSlider.addEventListener('input', ()=> { document.getElementById('gm-panel').style.fontSize = txtSlider.value + 'px'; textSize = txtSlider.value; saveSettings(); });
+
+        const opSlider = document.getElementById('gm-opacity');
+        opSlider.addEventListener('input', ()=> { document.getElementById('gm-panel').style.background = `rgba(20,20,20,${opSlider.value})`; panelOpacity = opSlider.value; saveSettings(); });
+
+        const fontPicker = document.getElementById('gm-fontcolor');
+        fontPicker.addEventListener('input', ()=> {
+            fontColor = fontPicker.value;
+            // set css variable on panel so all uses of var(--gm-font-color) update
+            const panelEl = document.getElementById('gm-panel');
+            if(panelEl) panelEl.style.setProperty('--gm-font-color', fontColor);
+            // update links color immediately
+            document.querySelectorAll('.gm-link').forEach(l=> l.style.color = fontColor);
+            // update source line colors (they use var but ensure immediate)
+            document.querySelectorAll('.line-content').forEach(el => el.style.color = fontColor);
+            saveSettings();
+        });
+
+        const linkPicker = document.getElementById('gm-linkborder');
+        linkPicker.addEventListener('input', ()=> {
+            const hex = linkPicker.value;
+            linkBorderColor = hexToRgba(hex, 0.12);
+            document.querySelectorAll('.gm-item').forEach(it=> it.style.border = `1px solid ${linkBorderColor}`);
+            saveSettings();
+        });
+
+        // initial apply font color so it shows correctly on first show
+        const panelEl = document.getElementById('gm-panel');
+        if(panelEl) panelEl.style.setProperty('--gm-font-color', fontColor);
+    }
+
+    /* ---------- Utilities & Rendering ---------- */
+
+    function abs(u){ try{ return new URL(u, location.href).href } catch { return null; } }
+
+    function scan(){
+        const set = new Map();
+        if(location.search.length > 1) set.set(location.href, location.href);
+        document.querySelectorAll("a[href*='?']").forEach(a=>{
+            const u = abs(a.href);
+            if(!u) return;
+            set.set(u, u);
+        });
+        results = [...set.values()];
+        render();
+    }
+
+    function filteredResults(){
+        const filterEl = document.getElementById('gm-filter');
+        const filter = filterEl ? (filterEl.value||'').toLowerCase().trim() : '';
+        if(!filter) return results;
+        return results.filter(u => u.toLowerCase().includes(filter));
+    }
+
+    function render(){
+        const refs = createPanel._refs;
+        if(!refs) return;
+        const listEl = refs.listEl;
+        const filterCount = refs.filterCount;
+        listEl.innerHTML = '';
+        const items = filteredResults();
+        filterCount.textContent = `${items.length} result${items.length===1?'':'s'}`;
+        if(items.length === 0){
+            const empty = document.createElement('div'); empty.textContent = 'No matching URLs'; empty.style.color = '#999'; listEl.appendChild(empty); return;
+        }
+        items.forEach(u=>{
+            const d = document.createElement('div'); d.className='gm-item';
+            const link = document.createElement('div'); link.className='gm-link'; link.textContent = u; link.addEventListener('click', ()=> window.open(u, '_blank'));
+            const copy = document.createElement('div'); copy.className='gm-copy'; copy.textContent='Copy'; copy.addEventListener('click', e=>{ e.stopPropagation(); navigator.clipboard.writeText(u); copy.textContent='Copied'; setTimeout(()=>copy.textContent='Copy',900);});
+            d.appendChild(link); d.appendChild(copy);
+            d.style.border = `1px solid ${linkBorderColor}`;
+            listEl.appendChild(d);
+        });
+    }
+
+    /* ---------- Source fetching & rendering (cached) ---------- */
+
+    async function loadSourceIfNeeded(){
+        const url = location.href;
+        if(cachedUrl === url && sourceLines.length) return;
+        const panel = document.getElementById('gm-panel'); if(panel) panel.style.display='none';
+        try{
+            const res = await fetch(url, { cache: 'no-store' });
+            const txt = await res.text();
+            sourceLines = txt.split(/\r?\n/);
+            cachedUrl = url;
+        } catch(e){
+            sourceLines = [`Error fetching source: ${e}`];
+            cachedUrl = url;
+        } finally {
+            if(panel) panel.style.display='flex';
+        }
+    }
+
+    function escapeHtml(str){ return String(str).replace(/[&<>]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch])); }
+
+    function renderSource(){
+        const refs = createPanel._refs;
+        if(!refs) return;
+        const wrap = document.getElementById('gm-source-code');
+        wrap.innerHTML = '';
+        const frag = document.createDocumentFragment();
+        sourceLines.forEach((line, i)=>{
+            const div = document.createElement('div'); div.className = 'line';
+            const num = document.createElement('div'); num.className='line-number'; num.textContent = String(i+1).padStart(4,' ');
+            const content = document.createElement('div'); content.className='line-content'; content.innerHTML = escapeHtml(line);
+            div.appendChild(num); div.appendChild(content); frag.appendChild(div);
+        });
+        wrap.appendChild(frag);
+        matches = []; currentMatchIndex = -1;
+        document.getElementById('gm-match-counter').textContent = '0 / 0';
+        const findVal = document.getElementById('gm-find-source')?.value;
+        if(findVal && findVal.trim()) performSearch(findVal);
+    }
+
+    /* ---------- Searching inside cached source (fast) ---------- */
+
+    function performSearch(query){
+        const wrap = document.getElementById('gm-source-code');
+        if(!wrap) return;
+        const q = (query||'').trim();
+        matches = []; currentMatchIndex = -1;
+        if(!q){
+            // clear highlights by re-rendering raw HTML but keep scroll position
+            renderSource();
+            return;
+        }
+        const esc = escapeRegExp(q);
+        let regex;
+        try { regex = new RegExp(esc, 'gi'); } catch(e) { regex = new RegExp(esc.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi'); }
+
+        // build fragment with marks
+        const frag = document.createDocumentFragment();
+        sourceLines.forEach((line, i)=>{
+            const div = document.createElement('div'); div.className = 'line';
+            const num = document.createElement('div'); num.className='line-number'; num.textContent = String(i+1).padStart(4,' ');
+            const content = document.createElement('div'); content.className='line-content';
+            // find positions
+            let positions = [];
+            regex.lastIndex = 0;
+            let m;
+            while((m = regex.exec(line)) !== null){
+                positions.push({start: m.index, len: m[0].length, text: m[0]});
+                if(m.index === regex.lastIndex) regex.lastIndex++;
+            }
+            if(positions.length === 0){
+                content.innerHTML = escapeHtml(line);
+            } else {
+                // build html with marks
+                let out = '';
+                let cursor = 0;
+                positions.forEach(p=>{
+                    out += escapeHtml(line.slice(cursor, p.start)) + `<mark class="gm-match">${escapeHtml(line.substr(p.start, p.len))}</mark>`;
+                    matches.push({lineIndex: i, charIndex: p.start, length: p.len});
+                    cursor = p.start + p.len;
+                });
+                out += escapeHtml(line.slice(cursor));
+                content.innerHTML = out;
+            }
+            div.appendChild(num); div.appendChild(content); frag.appendChild(div);
+        });
+        wrap.innerHTML = '';
+        wrap.appendChild(frag);
+
+        // update counter
+        const total = matches.length;
+        currentMatchIndex = total > 0 ? 0 : -1;
+        document.getElementById('gm-match-counter').textContent = `${ total>0 ? currentMatchIndex+1 : 0 } / ${total}`;
+        focusMatch();
+    }
+
+    function focusMatch(){
+        if(matches.length === 0){ document.getElementById('gm-match-counter').textContent = '0 / 0'; return; }
+        // remove previous active
+        document.querySelectorAll('.gm-active').forEach(el => el.classList.remove('gm-active'));
+        // find all marks in document order
+        const allMarks = Array.from(document.querySelectorAll('mark.gm-match'));
+        const target = allMarks[currentMatchIndex];
+        if(!target){
+            document.getElementById('gm-match-counter').textContent = `${ currentMatchIndex+1 } / ${ matches.length }`;
+            return;
+        }
+        target.classList.add('gm-active');
+        const parentContent = target.closest('.line-content');
+        if(parentContent) parentContent.classList.add('gm-active');
+        target.scrollIntoView({behavior:'smooth', block:'center'});
+        document.getElementById('gm-match-counter').textContent = `${ currentMatchIndex+1 } / ${ matches.length }`;
+    }
+
+    /* ---------- Helpers ---------- */
+    function escapeRegExp(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+    function rgbaToHex(rgba){ const m = (rgba||'').match(/\d+/g); if(!m||m.length<3) return "#ffffff"; return "#"+m.slice(0,3).map(x=>('0'+parseInt(x).toString(16)).slice(-2)).join(''); }
+    function hexToRgba(hex, alpha=1){ const v = hex.replace('#',''); const r = parseInt(v.substring(0,2),16); const g = parseInt(v.substring(2,4),16); const b = parseInt(v.substring(4,6),16); return `rgba(${r},${g},${b},${alpha})`; }
+
+    /* ---------- Observer & navigation hooks ---------- */
+    const observer = new MutationObserver(()=>{ clearTimeout(observer._t); observer._t = setTimeout(()=>{ if(document.querySelector('.gm-tab.active')?.dataset.tab === 'parameters') scan(); }, 200); });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    ["pushState","replaceState"].forEach(fn=>{
+        const orig = history[fn];
+        history[fn] = function(){ orig.apply(this, arguments); window.dispatchEvent(new Event('locationchange')); };
+    });
+    window.addEventListener('popstate', ()=> window.dispatchEvent(new Event('locationchange')));
+    window.addEventListener('locationchange', ()=> setTimeout(()=>{ if(document.querySelector('.gm-tab.active')?.dataset.tab === 'parameters') scan(); }, 200) );
+
+    /* ---------- Init ---------- */
+    function createPanelAndStart(){
+        createPanel(); createFloatingBubble(); scan();
+        // ensure initial font color applied
+        const panelEl = document.getElementById('gm-panel');
+        if(panelEl) panelEl.style.setProperty('--gm-font-color', fontColor);
+    }
+    createPanelAndStart();
+
+    // expose scan
+    window.__gm_scan = scan;
+
+})();
